@@ -1,0 +1,29 @@
+#!/usr/bin/env bun
+import { domain, secret, baseUrl } from "../lib/env.ts"
+
+function usage() {
+  console.log(`Usage: cf-delete <sha1> [sha1 ...]
+
+Delete images from the worker.
+Requires .cf-resizer.yaml`)
+  process.exit(1)
+}
+
+const args = process.argv.slice(2)
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") usage()
+
+async function main() {
+  for (const sha1 of args) {
+    const res = await fetch(`${baseUrl}/delete/${secret}/${sha1}`, {
+      method: "DELETE",
+    })
+
+    if (!res.ok) {
+      console.error(`delete ${sha1}: ${res.status} ${await res.text()}`)
+    } else {
+      console.log(`deleted ${sha1}`)
+    }
+  }
+}
+
+main().catch((e) => { console.error(e.message); process.exit(1) })

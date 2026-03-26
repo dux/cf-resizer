@@ -1,0 +1,148 @@
+#!/usr/bin/env bun
+import sharp from "sharp"
+import { existsSync, copyFileSync, writeFileSync, readFileSync } from "fs"
+import { basename, extname, resolve } from "path"
+import { tmpdir } from "os"
+import { join } from "path"
+
+// Try to read max_size from .cf-resizer.yaml, walk up from cwd
+function loadMaxWidth(): number {
+  let dir = process.cwd()
+  while (true) {
+    const p = resolve(dir, ".cf-resizer.yaml")
+    if (existsSync(p)) {
+      const m = readFileSync(p, "utf8").match(/max_size\s*:\s*(\d+)/)
+      if (m) return parseInt(m[1], 10)
+      break
+    }
+    const parent = resolve(dir, "..")
+    if (parent === dir) break
+    dir = parent
+  }
+  return 1600
+}
+
+const MAX_SIZE = loadMaxWidth()
+
+function usage() {
+  console.log(`Usage: cf-prepare <file-or-url> [-o output.webp]
+
+Resize image to max ${MAX_SIZE}px and convert to webp (q90).
+Without -o, prints image stats (dry run).
+SVG files pass through unchanged.`)
+  process.exit(1)
+}
+
+const args = process.argv.slice(2)
+if (args.length === 0) usage()
+
+let input: string | undefined
+let output: string | undefined
+
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "-o" && args[i + 1]) {
+    output = args[++i]
+  } else if (args[i] === "--help" || args[i] === "-h") {
+    usage()
+  } else if (!input) {
+    input = args[i]
+  }
+}
+
+if (!input) usage()
+
+async function fetchToTmp(url: string): Promise<string> {
+  const res = await fetch(url)
+  if (!res.ok) {
+    console.error(`Failed to fetch ${url}: ${res.status}`)
+    process.exit(1)
+  }
+  const buf = Buffer.from(await res.arrayBuffer())
+  const ext = extname(new URL(url).pathname) || ".jpg"
+  const tmp = join(tmpdir(), `cf-prepare-${Date.now()}${ext}`)
+  writeFileSync(tmp, buf)
+  return tmp
+}
+
+function isSvg(path: string): boolean {
+  return extname(path).toLowerCase() === ".svg"
+}
+
+function isUrl(s: string): boolean {
+  return s.startsWith("http://") || s.startsWith("https://")
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+}
+
+async function main() {
+  let filePath = input!
+  let cleanup: string | undefined
+
+  if (isUrl(filePath)) {
+    filePath = await fetchToTmp(filePath)
+    cleanup = filePath
+  }
+
+  if (!existsSync(filePath)) {
+    console.error(`File not found: ${filePath}`)
+    process.exit(1)
+  }
+
+  // SVG passthrough
+  if (isSvg(filePath) || isSvg(input!)) {
+    if (output) {
+      copyFileSync(filePath, output)
+      console.log(`svg -> ${output} (unchanged)`)
+    } else {
+      const stat = Bun.file(filePath)
+      console.log(`svg ${formatSize(stat.size)} (unchanged)`)
+    }
+    if (cleanup) Bun.file(cleanup).delete()
+    return
+  }
+
+  const img = sharp(filePath)
+  const meta = await img.metadata()
+  const w = meta.width || 0
+  const h = meta.height || 0
+  const fmt = meta.format || "unknown"
+  const fileSize = Bun.file(filePath).size
+
+  const needsResize = w > MAX_SIZE || h > MAX_SIZE
+  let pipeline = img
+
+  if (needsResize) {
+    pipeline = pipeline.resize({
+      width: w > h ? MAX_SIZE : undefined,
+      height: h >= w ? MAX_SIZE : undefined,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+  }
+
+  pipeline = pipeline.webp({ quality: 90 })
+
+  if (output) {
+    const buf = await pipeline.toBuffer()
+    const outMeta = await sharp(buf).metadata()
+    writeFileSync(output, buf)
+    console.log(`${w}x${h} ${fmt} ${formatSize(fileSize)} -> ${outMeta.width}x${outMeta.height} webp ${formatSize(buf.length)} ${output}`)
+  } else {
+    // Dry run - estimate output
+    const buf = await pipeline.toBuffer()
+    const outMeta = await sharp(buf).metadata()
+    const arrow = needsResize ? `-> ${outMeta.width}x${outMeta.height} webp ${formatSize(buf.length)}` : `-> ${w}x${h} webp ${formatSize(buf.length)}`
+    console.log(`${w}x${h} ${fmt} ${formatSize(fileSize)} ${arrow}`)
+  }
+
+  if (cleanup) Bun.file(cleanup).delete()
+}
+
+main().catch((e) => {
+  console.error(e.message)
+  process.exit(1)
+})

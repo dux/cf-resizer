@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FIXTURES="$ROOT/test/fixtures"
+TMP="$ROOT/tmp"
+PASS=0
+FAIL=0
+
+red()   { printf "\033[31m%s\033[0m\n" "$*"; }
+green() { printf "\033[32m%s\033[0m\n" "$*"; }
+bold()  { printf "\033[1m%s\033[0m\n" "$*"; }
+
+ok()   { green "  PASS: $*"; PASS=$((PASS + 1)); }
+fail() { red   "  FAIL: $*"; FAIL=$((FAIL + 1)); }
+
+check() {
+  if eval "$1" >/dev/null 2>&1; then ok "$2"; else fail "$2"; fi
+}
+
+# Find .cf-resizer.yaml - walk up from cwd
+YAML=""
+SEARCH="$(pwd)"
+while [ "$SEARCH" != "/" ]; do
+  if [ -f "$SEARCH/.cf-resizer.yaml" ]; then YAML="$SEARCH/.cf-resizer.yaml"; break; fi
+  SEARCH="$(dirname "$SEARCH")"
+done
+
+if [ -z "$YAML" ]; then
+  fail ".cf-resizer.yaml not found"
+  bold "Results: $PASS passed, $FAIL failed"
+  exit 1
+fi
+
+DOMAIN=$(grep '^domain:' "$YAML" | sed 's/domain:\s*//' | tr -d ' "'"'")
+SECRET=$(grep '^secret:' "$YAML" | sed 's/secret:\s*//' | tr -d ' "'"'")
+BUCKET=$(grep '^bucket:' "$YAML" | sed 's/bucket:\s*//' | tr -d ' "'"'")
+BASE="https://$DOMAIN"
+ZONE=$(echo "$DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
+
+# --- Phase 1: Environment ---
+run_env() {
+  bold "Phase 1: Environment"
+  check "command -v bun"      "bun installed"
+  check "[ -f '$YAML' ]"    ".cf-resizer.yaml found"
+  check "[ -n '$DOMAIN' ]"  "domain: $DOMAIN"
+  check "[ -n '$SECRET' ]"  "secret: set"
+  check "[ -n '$BUCKET' ]"  "bucket: $BUCKET"
+
+  # wrangler
+  if command -v wrangler >/dev/null 2>&1; then
+    ok "wrangler installed"
+    local wv
+    wv=$(wrangler --version 2>&1 | head -1)
+    ok "wrangler version: $wv"
+    # test wrangler auth by listing r2 buckets
+    local wrangler_env=""
+    # use Global API Key if available
+    if [ -n "$CF_API_KEY" ] && [ -n "$CF_API_EMAIL" ]; then
+      export CLOUDFLARE_API_KEY="$CF_API_KEY"
+      export CLOUDFLARE_EMAIL="$CF_API_EMAIL"
+      unset CF_API_TOKEN CLOUDFLARE_API_TOKEN
+    fi
+    if npx wrangler r2 bucket list >/dev/null 2>&1; then
+      ok "wrangler auth works"
+      if npx wrangler r2 bucket list 2>/dev/null | grep -q "$BUCKET"; then
+        ok "R2 bucket '$BUCKET' exists"
+      else
+        fail "R2 bucket '$BUCKET' not found"
+      fi
+    else
+      fail "wrangler auth (check CLOUDFLARE_API_KEY/EMAIL or CLOUDFLARE_API_TOKEN)"
+    fi
+  else
+    fail "wrangler not installed"
+  fi
+
+  # flarectl
+  if command -v flarectl >/dev/null 2>&1; then
+    ok "flarectl installed"
+    if flarectl zone list >/dev/null 2>&1; then
+      ok "flarectl auth works"
+    else
+      fail "flarectl auth (check CF_API_KEY/CF_API_EMAIL or CF_API_TOKEN)"
+    fi
+  else
+    fail "flarectl not installed"
+  fi
+
+  echo
+}
+
+# --- Phase 2: DNS ---
+run_dns() {
+  bold "Phase 2: DNS"
+
+  # Check DNS record via flarectl
+  if command -v flarectl >/dev/null 2>&1; then
+    if flarectl dns list --zone "$ZONE" 2>/dev/null | grep -q "$DOMAIN"; then
+      ok "DNS record for $DOMAIN exists in zone $ZONE"
+    else
+      fail "DNS record for $DOMAIN not found in zone $ZONE"
+    fi
+  else
+    fail "flarectl not available, skipping DNS record check"
+  fi
+
+  # Check DNS resolves
+  if dig +short "$DOMAIN" 2>/dev/null | grep -q .; then
+    ok "$DOMAIN resolves"
+  else
+    fail "$DOMAIN does not resolve"
+  fi
+
+  # Check HTTPS reachable
+  local status
+  status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://$DOMAIN/" 2>/dev/null)
+  if [ "$status" = "200" ]; then
+    ok "https://$DOMAIN/ reachable ($status)"
+  else
+    fail "https://$DOMAIN/ returned $status"
+  fi
+
+  echo
+}
+
+# --- Phase 3: Local ---
+run_local() {
+  bold "Phase 3: Local tests"
+  mkdir -p "$TMP" "$FIXTURES"
+
+  # Generate fixtures if missing
+  if [ ! -f "$FIXTURES/photo.jpg" ]; then
+    bold "  Generating fixtures..."
+    bash "$ROOT/test/create-fixtures.sh"
+  fi
+
+  # cf-prepare tests
+  for fmt in jpg png webp avif tiff; do
+    local src="$FIXTURES/photo.$fmt"
+    if [ ! -f "$src" ]; then fail "fixture photo.$fmt missing"; continue; fi
+
+    local out="$TMP/out-$fmt.webp"
+    if bun "$ROOT/bin/cf-prepare" "$src" -o "$out" >/dev/null 2>&1; then
+      ok "cf-prepare photo.$fmt"
+    else
+      fail "cf-prepare photo.$fmt"
+    fi
+  done
+
+  # SVG passthrough
+  if [ -f "$FIXTURES/icon.svg" ]; then
+    if bun "$ROOT/bin/cf-prepare" "$FIXTURES/icon.svg" -o "$TMP/out.svg" >/dev/null 2>&1; then
+      if diff -q "$FIXTURES/icon.svg" "$TMP/out.svg" >/dev/null 2>&1; then
+        ok "svg passthrough (unchanged)"
+      else
+        fail "svg was modified"
+      fi
+    else
+      fail "cf-prepare icon.svg"
+    fi
+  fi
+
+  # Client lib test
+  local url
+  url=$(bun -e "import {cfResizeUrl} from '$ROOT/lib/cf-resizer.ts'; console.log(cfResizeUrl('a'.repeat(40), {w:300, domain:'img.test.com'}))" 2>/dev/null)
+  if echo "$url" | grep -q "r/w300"; then
+    ok "TS client lib generates correct URL"
+  else
+    fail "TS client lib: $url"
+  fi
+
+  echo
+}
+
+# --- Phase 4: Integration ---
+run_integration() {
+  bold "Phase 4: Integration tests"
+  mkdir -p "$TMP" "$FIXTURES"
+
+  # Generate fixtures if missing
+  if [ ! -f "$FIXTURES/small.jpg" ]; then
+    bold "  Generating fixtures..."
+    bash "$ROOT/test/create-fixtures.sh"
+  fi
+
+  # Upload test image
+  local output
+  output=$(bun "$ROOT/bin/cf-upload" "$FIXTURES/small.jpg" 2>&1)
+  local sha1
+  sha1=$(echo "$output" | grep -oE '[0-9a-f]{40}')
+
+  if [ -n "$sha1" ]; then
+    ok "upload returned sha1: ${sha1:0:12}..."
+  else
+    fail "upload failed: $output"
+  fi
+
+  sleep 2
+
+  # Test original
+  local status
+  if [ -n "$sha1" ]; then
+    status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/$sha1")
+    check "[ '$status' = '200' ]" "GET /$sha1 -> $status"
+
+    # Test resize
+    status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/r/w300/$sha1")
+    check "[ '$status' = '200' ]" "GET /r/w300/$sha1 -> $status"
+
+    # Test crop
+    status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/r/c200/$sha1")
+    check "[ '$status' = '200' ]" "GET /r/c200/$sha1 -> $status"
+
+    # Test WxH crop
+    status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/r/c200x150/$sha1")
+    check "[ '$status' = '200' ]" "GET /r/c200x150/$sha1 -> $status"
+
+    # Test query params
+    status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/r/$sha1?w=300")
+    check "[ '$status' = '200' ]" "GET /r/$sha1?w=300 -> $status"
+
+    # Test cache headers
+    local cache
+    cache=$(curl -s -I "$BASE/$sha1" | grep -i cache-control)
+    if echo "$cache" | grep -qi "immutable"; then
+      ok "cache headers: immutable"
+    else
+      fail "cache headers: $cache"
+    fi
+
+    # Test webp content negotiation
+    local ct
+    ct=$(curl -s -I -H "Accept: image/webp" "$BASE/$sha1" | grep -i content-type)
+    if echo "$ct" | grep -qi "webp"; then
+      ok "content negotiation: webp"
+    else
+      fail "content negotiation: $ct"
+    fi
+  else
+    fail "skipping image tests (no sha1 from upload)"
+  fi
+
+  # Test 404
+  status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/0000000000000000000000000000000000000000")
+  check "[ '$status' = '404' ]" "GET /nonexistent -> $status"
+
+  # Test list endpoint
+  local list_status
+  list_status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/list/$SECRET?limit=5")
+  check "[ '$list_status' = '200' ]" "GET /list/SECRET -> $list_status"
+
+  # Test unauthorized access
+  local unauth
+  unauth=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/list/wrong_secret")
+  check "[ '$unauth' = '401' ]" "GET /list/wrong (no auth) -> $unauth"
+
+  # Cleanup
+  if [ -n "$sha1" ]; then
+    bun "$ROOT/bin/cf-delete" "$sha1" >/dev/null 2>&1 && ok "cleanup: deleted test image" || fail "cleanup failed"
+  fi
+
+  echo
+}
+
+# --- Run ---
+bold "cf-resizer test suite"
+echo
+
+PHASE="${1:-all}"
+case "$PHASE" in
+  env)         run_env ;;
+  dns)         run_env; run_dns ;;
+  local)       run_env; run_local ;;
+  integration) run_env; run_integration ;;
+  all)         run_env; run_dns; run_local; run_integration ;;
+  *)           echo "Usage: cf-test [env|dns|local|integration|all]"; exit 1 ;;
+esac
+
+bold "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] && exit 0 || exit 1

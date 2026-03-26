@@ -1,0 +1,104 @@
+#!/usr/bin/env bun
+import sharp from "sharp"
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs"
+import { extname } from "path"
+import { tmpdir } from "os"
+import { join } from "path"
+import { domain, secret, baseUrl, maxSize } from "../lib/env.ts"
+
+function usage() {
+  console.log(`Usage: cf-upload <file-or-url>
+
+Auto-prepares (resize + webp) and uploads via worker.
+SVG files uploaded as-is.
+Prints full CDN URL on success.
+
+Requires .cf-resizer.yaml`)
+  process.exit(1)
+}
+
+const args = process.argv.slice(2)
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") usage()
+
+const input = args[0]
+
+function isUrl(s: string): boolean {
+  return s.startsWith("http://") || s.startsWith("https://")
+}
+
+function isSvg(path: string): boolean {
+  return extname(path).toLowerCase() === ".svg"
+}
+
+async function fetchToTmp(url: string): Promise<string> {
+  const res = await fetch(url)
+  if (!res.ok) { console.error(`Failed to fetch ${url}: ${res.status}`); process.exit(1) }
+  const buf = Buffer.from(await res.arrayBuffer())
+  const ext = extname(new URL(url).pathname) || ".jpg"
+  const tmp = join(tmpdir(), `cf-upload-${Date.now()}${ext}`)
+  writeFileSync(tmp, buf)
+  return tmp
+}
+
+async function prepare(filePath: string): Promise<Buffer> {
+  const img = sharp(filePath)
+  const meta = await img.metadata()
+  const w = meta.width || 0
+  const h = meta.height || 0
+  let pipeline = img
+  if (w > maxSize || h > maxSize) {
+    pipeline = pipeline.resize({
+      width: w > h ? maxSize : undefined,
+      height: h >= w ? maxSize : undefined,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+  }
+  return pipeline.webp({ quality: 90 }).toBuffer()
+}
+
+async function main() {
+  let filePath = input
+  let cleanup: string | undefined
+
+  if (isUrl(filePath)) {
+    filePath = await fetchToTmp(filePath)
+    cleanup = filePath
+  }
+
+  if (!existsSync(filePath)) {
+    console.error(`File not found: ${filePath}`)
+    process.exit(1)
+  }
+
+  let data: Buffer
+  let contentType: string
+
+  if (isSvg(filePath) || isSvg(input)) {
+    data = Buffer.from(readFileSync(filePath))
+    contentType = "image/svg+xml"
+  } else {
+    data = await prepare(filePath)
+    contentType = "image/webp"
+  }
+
+  const res = await fetch(`${baseUrl}/upload/${secret}`, {
+    method: "PUT",
+    headers: { "Content-Type": contentType },
+    body: data,
+  })
+
+  if (!res.ok) {
+    console.error(`Upload failed: ${res.status} ${await res.text()}`)
+    process.exit(1)
+  }
+
+  const json = await res.json() as any
+  console.log(json.url)
+
+  if (cleanup) {
+    try { unlinkSync(cleanup) } catch {}
+  }
+}
+
+main().catch((e) => { console.error(e.message); process.exit(1) })

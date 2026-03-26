@@ -1,0 +1,45 @@
+#!/usr/bin/env bun
+import { readFileSync, existsSync } from "fs"
+import { basename } from "path"
+import { domain, secret, baseUrl } from "../lib/env.ts"
+
+function usage() {
+  console.log(`Usage: cf-asset <file> [path]
+
+Upload file to /assets/. Serves via CDN with immutable cache.
+
+  cf-asset app.js                -> /assets/app.js
+  cf-asset build/app.min.js      -> /assets/app.min.js
+  cf-asset app.js vendor/app.js  -> /assets/vendor/app.js
+  cf-asset app.js vendor/        -> /assets/vendor/app.js
+
+Requires .cf-resizer.yaml`)
+  process.exit(1)
+}
+
+const args = process.argv.slice(2)
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") usage()
+
+const file = args[0]
+let remotePath = args[1] || basename(file)
+if (remotePath.endsWith("/")) remotePath += basename(file)
+
+if (!existsSync(file)) {
+  console.error(`File not found: ${file}`)
+  process.exit(1)
+}
+
+const data = readFileSync(file)
+
+const res = await fetch(`${baseUrl}/assets/${secret}/${remotePath}`, {
+  method: "PUT",
+  body: data,
+})
+
+if (!res.ok) {
+  console.error(`Upload failed: ${res.status} ${await res.text()}`)
+  process.exit(1)
+}
+
+const json = await res.json() as any
+console.log(json.url)

@@ -1,0 +1,49 @@
+#!/usr/bin/env bun
+import { resolve, dirname } from "path"
+import { readFileSync } from "fs"
+import { spawnSync } from "child_process"
+
+const BIN = dirname(new URL(import.meta.url).pathname)
+
+const commands: Record<string, { script: string; desc: string }> = {
+  install: { script: "cf-install", desc: "Generate config, create DNS, deploy" },
+  prepare: { script: "cf-prepare", desc: "Resize + convert image to webp" },
+  upload:  { script: "cf-upload",  desc: "Auto-prepare + upload via worker" },
+  list:    { script: "cf-list",    desc: "List images (default 20, pass number for more)" },
+  delete:  { script: "cf-delete",  desc: "Delete images by sha1" },
+  asset:   { script: "cf-asset",   desc: "Upload any file to /assets/" },
+  test:    { script: "cf-test",    desc: "Test env, DNS, local tools, integration" },
+}
+
+function help() {
+  console.log(`cf-resizer - Cloudflare image resize toolkit
+github.com/dux/cf-resizer
+
+Commands:`)
+  for (const [name, { desc }] of Object.entries(commands)) {
+    console.log(`  ${name.padEnd(10)} ${desc}`)
+  }
+  console.log(`  help       Show this help`)
+  console.log(`
+Usage: cf-resizer <command> [args...]
+Config: .cf-resizer.yaml (domain, secret, bucket, max_size)`)
+}
+
+const [cmd, ...rest] = process.argv.slice(2)
+
+if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
+  help()
+  process.exit(0)
+}
+
+if (commands[cmd]) {
+  const script = resolve(BIN, commands[cmd].script)
+  const head = readFileSync(script, "utf8").slice(0, 64)
+  const runner = head.includes("bash") ? "bash" : "bun"
+  const r = spawnSync(runner, [script, ...rest], { stdio: "inherit" })
+  process.exit(r.status || 0)
+} else {
+  console.error(`Unknown command: ${cmd}`)
+  help()
+  process.exit(1)
+}

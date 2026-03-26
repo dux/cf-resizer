@@ -1,0 +1,30 @@
+#!/usr/bin/env bun
+import { domain, secret, baseUrl } from "../lib/env.ts"
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+}
+
+const limit = parseInt(process.argv[2] || "20", 10)
+
+async function main() {
+  const params = new URLSearchParams({ limit: String(limit) })
+
+  const res = await fetch(`${baseUrl}/list/${secret}?${params}`)
+
+  if (!res.ok) {
+    console.error(`List failed: ${res.status} ${await res.text()}`)
+    process.exit(1)
+  }
+
+  const json = await res.json() as any
+  for (const item of json.items) {
+    console.log(`${formatSize(item.size).padStart(8)}  ${item.sha1}`)
+  }
+
+  console.log(`\n${json.items.length} objects${json.cursor ? " (more available)" : ""}`)
+}
+
+main().catch((e) => { console.error(e.message); process.exit(1) })

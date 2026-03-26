@@ -1,0 +1,32 @@
+{
+  "name": "cf-resizer",
+  "type": "module",
+  "bin": {
+    "cf-resizer": "bin/cf-resizer"
+  },
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "bin/",
+    "lib/",
+    "src/"
+  ],
+  "scripts": {
+    "install": "bun bin/cf-resizer install",
+    "test": "bun bin/cf-resizer test",
+    "upload": "bun bin/cf-resizer upload",
+    "list": "bun bin/cf-resizer list",
+    "delete": "bun bin/cf-resizer delete",
+    "asset": "bun bin/cf-resizer asset",
+    "prepare": "bun bin/cf-resizer prepare",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "hono": "^4",
+    "sharp": "^0.33"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4",
+    "wrangler": "^4"
+  }
+}
