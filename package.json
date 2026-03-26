@@ -1,5 +1,6 @@
 {
   "name": "cf-resizer",
+  "version": "1.0.0",
   "type": "module",
   "bin": {
     "cf-resizer": "bin/cf-resizer"
@@ -19,6 +20,7 @@
     "delete": "bun bin/cf-resizer delete",
     "asset": "bun bin/cf-resizer asset",
     "prepare": "bun bin/cf-resizer prepare",
+    "deploy": "bun bin/cf-deploy",
     "dev": "wrangler dev"
   },
   "dependencies": {

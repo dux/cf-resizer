@@ -1,4 +1,4 @@
-import { Hono } from "hono"
+import { Hono, type Context } from "hono"
 
 type Bindings = {
   BUCKET: R2Bucket
@@ -8,8 +8,10 @@ type Bindings = {
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
+type Ctx = Context<{ Bindings: Bindings }>
 
 const DEFAULT_MAX_SIZE = 1600
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 // 10MB
 const CACHE_HEADER = "public, max-age=31536000, immutable"
 
 const MIME: Record<string, string> = {
@@ -29,7 +31,7 @@ interface TransformOpts {
   quality?: number
 }
 
-function parsePathTransforms(seg: string): TransformOpts {
+function parsePathTransforms(seg: string, maxSize = DEFAULT_MAX_SIZE): TransformOpts {
   const opts: TransformOpts = {}
   const re = /([whcq])(\d+(?:x\d+)?)/g
   let m: RegExpExecArray | null
@@ -37,18 +39,18 @@ function parsePathTransforms(seg: string): TransformOpts {
   while ((m = re.exec(seg)) !== null) {
     const [, key, val] = m
     if (key === "w") {
-      opts.width = clamp(parseInt(val, 10))
+      opts.width = clamp(parseInt(val, 10), maxSize)
       if (!opts.fit) opts.fit = "scale-down"
     } else if (key === "h") {
-      opts.height = clamp(parseInt(val, 10))
+      opts.height = clamp(parseInt(val, 10), maxSize)
       if (!opts.fit) opts.fit = "scale-down"
     } else if (key === "c") {
       if (val.includes("x")) {
         const [w, h] = val.split("x").map(Number)
-        opts.width = clamp(w)
-        opts.height = clamp(h)
+        opts.width = clamp(w, maxSize)
+        opts.height = clamp(h, maxSize)
       } else {
-        const s = clamp(parseInt(val, 10))
+        const s = clamp(parseInt(val, 10), maxSize)
         opts.width = s
         opts.height = s
       }
@@ -61,22 +63,22 @@ function parsePathTransforms(seg: string): TransformOpts {
   return opts
 }
 
-function parseQueryTransforms(url: URL): TransformOpts {
+function parseQueryTransforms(url: URL, maxSize = DEFAULT_MAX_SIZE): TransformOpts {
   const opts: TransformOpts = {}
   const w = url.searchParams.get("w")
   const h = url.searchParams.get("h")
   const c = url.searchParams.get("c")
   const q = url.searchParams.get("q")
 
-  if (w) { opts.width = clamp(parseInt(w, 10)); opts.fit = "scale-down" }
-  if (h) { opts.height = clamp(parseInt(h, 10)); opts.fit = "scale-down" }
+  if (w) { opts.width = clamp(parseInt(w, 10), maxSize); opts.fit = "scale-down" }
+  if (h) { opts.height = clamp(parseInt(h, 10), maxSize); opts.fit = "scale-down" }
   if (c) {
     if (c.includes("x")) {
       const [cw, ch] = c.split("x").map(Number)
-      opts.width = clamp(cw)
-      opts.height = clamp(ch)
+      opts.width = clamp(cw, maxSize)
+      opts.height = clamp(ch, maxSize)
     } else {
-      const s = clamp(parseInt(c, 10))
+      const s = clamp(parseInt(c, 10), maxSize)
       opts.width = s
       opts.height = s
     }
@@ -112,6 +114,8 @@ function chooseOutputFormat(sourceFormat: string, accept: string): string {
   if (sourceFormat === "svg") return "svg"
   if (accept.includes("image/avif")) return "avif"
   if (accept.includes("image/webp")) return "webp"
+  // Preserve PNG/GIF to keep transparency/animation
+  if (sourceFormat === "png" || sourceFormat === "gif") return sourceFormat
   return "jpeg"
 }
 
@@ -123,11 +127,16 @@ function isValidSha1(s: string): boolean {
   return /^[0-9a-f]{40}$/.test(s)
 }
 
+function getMaxSize(env: Bindings): number {
+  return parseInt(env.MAX_SIZE || "", 10) || DEFAULT_MAX_SIZE
+}
+
 function serveRaw(obj: R2ObjectBody, format: string): Response {
   return new Response(obj.body, {
     headers: {
       "Content-Type": MIME[format] || "application/octet-stream",
       "Cache-Control": CACHE_HEADER,
+      "Vary": "Accept",
     },
   })
 }
@@ -170,10 +179,13 @@ app.get("/:sha1{[0-9a-f]{40}}", async (c) => {
         headers: {
           "Content-Type": MIME[outFormat] || "application/octet-stream",
           "Cache-Control": CACHE_HEADER,
+          "Vary": "Accept",
         },
       })
     }
-  } catch {}
+  } catch (e: any) {
+    console.error("Format conversion error:", e.message || e)
+  }
 
   // Fallback: serve original
   return serveRaw(obj, sourceFormat)
@@ -186,7 +198,7 @@ app.get("/r/:transforms/:sha1{[0-9a-f]{40}}", async (c) => {
 
   if (!isValidSha1(sha1)) return c.text("Bad request", 400)
 
-  const opts = parsePathTransforms(transformStr)
+  const opts = parsePathTransforms(transformStr, getMaxSize(c.env))
   if (!hasTransforms(opts) && !opts.quality) {
     return c.redirect(`/${sha1}`, 302)
   }
@@ -198,7 +210,7 @@ app.get("/r/:transforms/:sha1{[0-9a-f]{40}}", async (c) => {
 app.get("/r/:sha1{[0-9a-f]{40}}", async (c) => {
   const sha1 = c.req.param("sha1")
   const url = new URL(c.req.url)
-  const opts = parseQueryTransforms(url)
+  const opts = parseQueryTransforms(url, getMaxSize(c.env))
 
   if (!hasTransforms(opts) && !opts.quality) {
     return c.redirect(`/${sha1}`, 302)
@@ -217,7 +229,7 @@ function cacheKey(sha1: string, opts: TransformOpts, format: string): string {
   return parts.join("_")
 }
 
-async function transform(c: any, sha1: string, opts: TransformOpts) {
+async function transform(c: Ctx, sha1: string, opts: TransformOpts) {
   const obj = await c.env.BUCKET.get(r2Key(sha1))
   if (!obj) return c.text("Not found", 404)
 
@@ -239,11 +251,10 @@ async function transform(c: any, sha1: string, opts: TransformOpts) {
       headers: {
         "Content-Type": MIME[outFormat] || "application/octet-stream",
         "Cache-Control": CACHE_HEADER,
+        "Vary": "Accept",
       },
     })
   }
-
-  const blob = await obj.arrayBuffer()
 
   // Build CF Image Resizing options
   const imageOpts: Record<string, any> = {
@@ -276,25 +287,33 @@ async function transform(c: any, sha1: string, opts: TransformOpts) {
         headers: {
           "Content-Type": MIME[outFormat] || "application/octet-stream",
           "Cache-Control": CACHE_HEADER,
+          "Vary": "Accept",
         },
       })
     }
 
     return new Response(`Transform failed: ${transformed.status}`, { status: 500 })
   } catch (e: any) {
-    return new Response(blob, {
-      headers: {
-        "Content-Type": MIME[sourceFormat] || "application/octet-stream",
-        "Cache-Control": CACHE_HEADER,
-      },
-    })
+    console.error("Transform error, serving original:", e.message || e)
+    // Fallback: re-read from R2 and serve original
+    const fallback = await c.env.BUCKET.get(r2Key(sha1))
+    if (!fallback) return c.text("Not found", 404)
+    return serveRaw(fallback, sourceFormat)
   }
 }
 
-function checkAuth(c: any): boolean {
+function checkAuth(c: Ctx): boolean {
   const secret = c.env.ADMIN_SECRET
   if (!secret) return false
-  return c.req.param("secret") === secret
+  const input = c.req.param("secret") || ""
+  if (input.length !== secret.length) return false
+  // Constant-time comparison to prevent timing attacks
+  const enc = new TextEncoder()
+  const a = enc.encode(input)
+  const b = enc.encode(secret)
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i]
+  return diff === 0
 }
 
 function detectMimeFromBytes(buf: ArrayBuffer): string {
@@ -305,6 +324,9 @@ function detectMimeFromBytes(buf: ArrayBuffer): string {
   if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
       bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp"
   if (bytes[0] === 0x42 && bytes[1] === 0x4D) return "image/bmp"
+  // TIFF: little-endian (II) or big-endian (MM)
+  if (bytes[0] === 0x49 && bytes[1] === 0x49 && bytes[2] === 0x2A && bytes[3] === 0x00) return "image/tiff"
+  if (bytes[0] === 0x4D && bytes[1] === 0x4D && bytes[2] === 0x00 && bytes[3] === 0x2A) return "image/tiff"
   if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
     const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11])
     if (brand === "avif" || brand === "avis") return "image/avif"
@@ -318,8 +340,12 @@ function detectMimeFromBytes(buf: ArrayBuffer): string {
 app.put("/upload/:secret", async (c) => {
   if (!checkAuth(c)) return c.text("Unauthorized", 401)
 
+  const len = parseInt(c.req.header("content-length") || "0", 10)
+  if (len > MAX_UPLOAD_BYTES) return c.text(`File too large (max ${MAX_UPLOAD_BYTES / 1024 / 1024}MB)`, 413)
+
   const body = await c.req.arrayBuffer()
   if (!body || body.byteLength === 0) return c.text("Empty body", 400)
+  if (body.byteLength > MAX_UPLOAD_BYTES) return c.text(`File too large (max ${MAX_UPLOAD_BYTES / 1024 / 1024}MB)`, 413)
 
   const hash = await crypto.subtle.digest("SHA-1", body)
   const sha1 = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, "0")).join("")
@@ -411,6 +437,118 @@ function mimeFromExt(path: string): string {
   return map[ext] || "application/octet-stream"
 }
 
+// Test page - grid of 100 resized variants for cache testing
+app.get("/test/:sha1{[0-9a-f]{40}}", async (c) => {
+  const sha1 = c.req.param("sha1")
+  const obj = await c.env.BUCKET.head(r2Key(sha1))
+  if (!obj) return c.text("Not found - upload an image first", 404)
+
+  const domain = c.env.DOMAIN || new URL(c.req.url).hostname
+  const base = `https://${domain}`
+
+  // Deterministic 100 test cases mixing all transform types
+  // Sizes range 200-350px, seeded from index so every reload is identical
+  const tests: { label: string; path: string; w: number; h: number }[] = []
+
+  for (let i = 0; i < 100; i++) {
+    const size = 200 + Math.round(i * 150 / 99) // 200..350
+    const variant = i % 5
+
+    let label: string
+    let path: string
+    let w: number
+    let h: number
+
+    if (variant === 0) {
+      // width only
+      const q = 60 + (i % 4) * 10 // 60,70,80,90
+      label = `w${size} q${q}`
+      path = `/r/w${size}q${q}/${sha1}`
+      w = size
+      h = Math.round(size * 0.75)
+    } else if (variant === 1) {
+      // height only
+      label = `h${size}`
+      path = `/r/h${size}/${sha1}`
+      w = Math.round(size * 1.33)
+      h = size
+    } else if (variant === 2) {
+      // square crop
+      label = `c${size}`
+      path = `/r/c${size}/${sha1}`
+      w = size
+      h = size
+    } else if (variant === 3) {
+      // rectangular crop
+      const h2 = Math.round(size * 0.6)
+      label = `c${size}x${h2}`
+      path = `/r/c${size}x${h2}/${sha1}`
+      w = size
+      h = h2
+    } else {
+      // width + height
+      const h2 = 200 + Math.round(((i * 7) % 100) * 150 / 99)
+      label = `w${size}h${h2}`
+      path = `/r/w${size}h${h2}/${sha1}`
+      w = size
+      h = h2
+    }
+
+    tests.push({ label, path, w, h })
+  }
+
+  const cards = tests.map((t, i) =>
+    `<div class="card">
+      <div class="img-wrap" style="width:${t.w}px;height:${t.h}px">
+        <img src="${base}${t.path}" width="${t.w}" height="${t.h}" loading="lazy" alt="#${i}">
+      </div>
+      <div class="info">#${i} <code>${t.label}</code></div>
+    </div>`
+  ).join("\n")
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cf-resizer test - ${sha1.slice(0, 12)}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f0f0f;color:#e0e0e0;padding:24px}
+h1{font-size:18px;font-weight:500;color:#f48120;margin-bottom:4px}
+.sub{font-size:13px;color:#888;margin-bottom:24px;font-family:ui-monospace,monospace}
+.grid{display:flex;flex-wrap:wrap;gap:12px;align-items:start}
+.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px;display:inline-flex;flex-direction:column;align-items:center;gap:6px;transition:border-color .15s}
+.card:hover{border-color:#f48120}
+.img-wrap{background:#111;border-radius:4px;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.img-wrap img{display:block;object-fit:contain}
+.info{font-size:11px;color:#999;font-family:ui-monospace,monospace;text-align:center;white-space:nowrap}
+.info code{color:#ccc}
+.stats{position:fixed;top:12px;right:16px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:10px 14px;font-size:12px;font-family:ui-monospace,monospace;color:#888;z-index:10}
+.stats b{color:#f48120}
+</style>
+</head>
+<body>
+<div class="stats">loaded <b id="cnt">0</b>/100</div>
+<h1>cf-resizer cache test</h1>
+<p class="sub">${sha1} - 100 images, reload to test cache hits</p>
+<div class="grid">
+${cards}
+</div>
+<script>
+let n=0;document.querySelectorAll("img").forEach(img=>{
+  const done=()=>{n++;document.getElementById("cnt").textContent=n};
+  if(img.complete)done();else{img.onload=done;img.onerror=done}
+})
+</script>
+</body>
+</html>`
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "no-cache" },
+  })
+})
+
 // Favicon
 app.get("/favicon.ico", (c) => {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#f48120"/></svg>`
@@ -456,11 +594,16 @@ export default {
       const url = new URL(request.url)
       const path = url.pathname
       // Cache image serves and transforms, skip admin/root endpoints
-      const skip = path === "/" || path === "/debug" || path.startsWith("/list/") || path.startsWith("/upload/") || path.startsWith("/delete/")
+      const skip = path === "/" || path === "/debug" || path.startsWith("/test/") || path.startsWith("/list/") || path.startsWith("/upload/") || path.startsWith("/delete/")
       if (!skip) {
         try {
           const cache = caches.default
-          const cacheKey = new Request(request.url, { method: "GET" })
+          // Include Accept header in cache key for format negotiation
+          const accept = request.headers.get("accept") || ""
+          const fmt = accept.includes("image/avif") ? "avif" : accept.includes("image/webp") ? "webp" : "default"
+          const cacheUrl = new URL(request.url)
+          cacheUrl.searchParams.set("_fmt", fmt)
+          const cacheKey = new Request(cacheUrl.toString(), { method: "GET" })
           const cached = await cache.match(cacheKey)
           if (cached) {
             const headers = new Headers(cached.headers)

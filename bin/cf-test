@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set +e
 
+# Source shell profile for CF_API_KEY/CF_API_EMAIL/CF_API_TOKEN if not set
+if [ -z "$CF_API_KEY" ] && [ -z "$CF_API_TOKEN" ]; then
+  for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zprofile"; do
+    if [ -f "$f" ]; then
+      eval "$(grep '^export CF_API' "$f" 2>/dev/null)"
+    fi
+  done
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES="$ROOT/test/fixtures"
@@ -137,7 +146,7 @@ run_local() {
   fi
 
   # cf-prepare tests
-  for fmt in jpg png webp avif tiff; do
+  for fmt in jpg png webp avif tiff gif; do
     local src="$FIXTURES/photo.$fmt"
     if [ ! -f "$src" ]; then fail "fixture photo.$fmt missing"; continue; fi
 
@@ -189,7 +198,7 @@ run_integration() {
   local output
   output=$(bun "$ROOT/bin/cf-upload" "$FIXTURES/small.jpg" 2>&1)
   local sha1
-  sha1=$(echo "$output" | grep -oE '[0-9a-f]{40}')
+  sha1=$(echo "$output" | grep -oE '[0-9a-f]{40}' | head -1)
 
   if [ -n "$sha1" ]; then
     ok "upload returned sha1: ${sha1:0:12}..."
@@ -238,6 +247,14 @@ run_integration() {
     else
       fail "content negotiation: $ct"
     fi
+
+    # Test avif content negotiation
+    ct=$(curl -s -I -H "Accept: image/avif,image/webp" "$BASE/$sha1" | grep -i content-type)
+    if echo "$ct" | grep -qi "avif"; then
+      ok "content negotiation: avif"
+    else
+      fail "content negotiation (avif): $ct"
+    fi
   else
     fail "skipping image tests (no sha1 from upload)"
   fi
@@ -255,6 +272,48 @@ run_integration() {
   local unauth
   unauth=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/list/wrong_secret")
   check "[ '$unauth' = '401' ]" "GET /list/wrong (no auth) -> $unauth"
+
+  # Test unauthorized delete
+  unauth=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/delete/wrong_secret/0000000000000000000000000000000000000000")
+  check "[ '$unauth' = '401' ]" "DELETE /delete/wrong (no auth) -> $unauth"
+
+  # Test SVG upload + passthrough
+  if [ -f "$FIXTURES/icon.svg" ]; then
+    local svg_out
+    svg_out=$(curl -s -X PUT --data-binary @"$FIXTURES/icon.svg" "$BASE/upload/$SECRET")
+    local svg_sha1
+    svg_sha1=$(echo "$svg_out" | grep -oE '[0-9a-f]{40}' | head -1)
+    if [ -n "$svg_sha1" ]; then
+      ok "SVG upload: ${svg_sha1:0:12}..."
+      sleep 1
+      local svg_ct
+      svg_ct=$(curl -s -I "$BASE/$svg_sha1" | grep -i content-type)
+      if echo "$svg_ct" | grep -qi "svg"; then
+        ok "SVG served as SVG (no conversion)"
+      else
+        fail "SVG content-type: $svg_ct"
+      fi
+      bun "$ROOT/bin/cf-delete" "$svg_sha1" >/dev/null 2>&1
+    else
+      fail "SVG upload failed: $svg_out"
+    fi
+  fi
+
+  # Test asset upload + serve
+  local asset_out
+  asset_out=$(curl -s -X PUT -H "Content-Type: text/plain" --data "test-asset-content" "$BASE/assets/$SECRET/test/hello.txt")
+  if echo "$asset_out" | grep -q "hello.txt"; then
+    ok "asset upload"
+    local asset_body
+    asset_body=$(curl -s "$BASE/assets/test/hello.txt")
+    if [ "$asset_body" = "test-asset-content" ]; then
+      ok "asset serve: correct content"
+    else
+      fail "asset serve: unexpected content"
+    fi
+  else
+    fail "asset upload: $asset_out"
+  fi
 
   # Cleanup
   if [ -n "$sha1" ]; then

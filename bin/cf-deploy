@@ -1,0 +1,59 @@
+#!/usr/bin/env bun
+import { resolve, dirname } from "path"
+import { writeFileSync } from "fs"
+import { spawnSync } from "child_process"
+import { tmpdir } from "os"
+import { domain, secret, bucket, maxSize } from "../lib/env.ts"
+
+const PKG_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..")
+const workerSrc = resolve(PKG_ROOT, "src/index.ts")
+const workerName = domain.replace(/\./g, "-")
+const zone = domain.split(".").slice(-2).join(".")
+const route = `${domain}/*`
+
+const toml = `name = "${workerName}"
+main = "${workerSrc}"
+compatibility_date = "2024-12-01"
+minify = true
+
+routes = [{ pattern = "${route}", zone_name = "${zone}" }]
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "${bucket}"
+
+[vars]
+ADMIN_SECRET = "${secret}"
+DOMAIN = "${domain}"
+MAX_SIZE = "${maxSize}"
+
+[triggers]
+crons = ["0 3 * * *"]
+`
+
+export const tomlPath = resolve(tmpdir(), `cf-resizer-${workerName}.toml`)
+writeFileSync(tomlPath, toml)
+
+export const wranglerEnv = { ...process.env }
+delete wranglerEnv.CF_API_TOKEN
+delete wranglerEnv.CLOUDFLARE_API_TOKEN
+wranglerEnv.CLOUDFLARE_API_KEY = process.env.CF_API_KEY || ""
+wranglerEnv.CLOUDFLARE_EMAIL = process.env.CF_API_EMAIL || ""
+
+export function deploy() {
+  console.log(`Deploying ${workerName}...`)
+  const r = spawnSync("npx", ["wrangler", "deploy", "--config", tomlPath], {
+    stdio: "inherit",
+    env: wranglerEnv,
+  })
+  if (r.status === 0) {
+    console.log(`\nDeployed to https://${domain}/`)
+  } else {
+    console.error("Deploy failed")
+    process.exit(1)
+  }
+}
+
+// Run directly
+const isMain = process.argv[1]?.endsWith("cf-deploy")
+if (isMain) deploy()

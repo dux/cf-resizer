@@ -1,10 +1,9 @@
 #!/usr/bin/env bun
-import { resolve, dirname } from "path"
+import { resolve } from "path"
 import { writeFileSync, readFileSync, existsSync } from "fs"
 import { spawnSync } from "child_process"
 import { createInterface } from "readline"
 
-const PKG_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..")
 const configPath = resolve(process.cwd(), ".cf-resizer.yaml")
 
 function parseYaml(text: string): Record<string, string> {
@@ -71,43 +70,12 @@ const yaml = `domain: ${config.domain}\nsecret: ${config.secret}\nbucket: ${conf
 writeFileSync(configPath, yaml)
 console.log(`Saved ${configPath}`)
 
-// --- Step 2: Generate wrangler.toml ---
-const { domain, secret, bucket, max_size } = config
-const maxSize = parseInt(max_size || "1600", 10)
-const workerSrc = resolve(PKG_ROOT, "src/index.ts")
-const workerName = domain.replace(/\./g, "-")
+// --- Step 2: DNS ---
+const { domain, bucket } = config
 const zone = domain.split(".").slice(-2).join(".")
-const route = `${domain}/*`
-
-const toml = `name = "${workerName}"
-main = "${workerSrc}"
-compatibility_date = "2024-12-01"
-minify = true
-
-routes = [{ pattern = "${route}", zone_name = "${zone}" }]
-
-[[r2_buckets]]
-binding = "BUCKET"
-bucket_name = "${bucket}"
-
-[vars]
-ADMIN_SECRET = "${secret}"
-DOMAIN = "${domain}"
-MAX_SIZE = "${maxSize}"
-
-[triggers]
-crons = ["0 3 * * *"]
-`
-
-import { tmpdir } from "os"
-
-const tomlPath = resolve(tmpdir(), `cf-resizer-${workerName}.toml`)
-writeFileSync(tomlPath, toml)
-console.log(`Generated ${tomlPath}`)
-
-// --- Step 3: DNS ---
-console.log(`Creating DNS A record for ${domain}...`)
 const subdomain = domain.split(".").slice(0, -2).join(".")
+
+console.log(`Creating DNS A record for ${domain}...`)
 const dns = spawnSync("flarectl", [
   "dns", "create",
   "--zone", zone,
@@ -128,12 +96,9 @@ if (dns.status === 0) {
   }
 }
 
-// --- Step 4: R2 bucket ---
-const wranglerEnv = { ...process.env }
-delete wranglerEnv.CF_API_TOKEN
-delete wranglerEnv.CLOUDFLARE_API_TOKEN
-wranglerEnv.CLOUDFLARE_API_KEY = process.env.CF_API_KEY || ""
-wranglerEnv.CLOUDFLARE_EMAIL = process.env.CF_API_EMAIL || ""
+// --- Step 3: R2 bucket ---
+// cf-deploy generates toml and wrangler env, reuse them
+const { tomlPath, wranglerEnv } = await import("./cf-deploy")
 
 const listBuckets = spawnSync("npx", ["wrangler", "r2", "bucket", "list", "--config", tomlPath], {
   stdio: "pipe",
@@ -154,16 +119,6 @@ if (bucketList.includes(bucket)) {
   }
 }
 
-// --- Step 5: Deploy ---
-console.log("Deploying worker...")
-const deploy = spawnSync("npx", ["wrangler", "deploy", "--config", tomlPath], {
-  stdio: "inherit",
-  env: wranglerEnv,
-})
-
-if (deploy.status === 0) {
-  console.log(`\nDeployed to https://${domain}/`)
-} else {
-  console.error("Deploy failed")
-  process.exit(1)
-}
+// --- Step 4: Deploy ---
+const { deploy } = await import("./cf-deploy")
+deploy()

@@ -7,6 +7,7 @@ const BIN = dirname(new URL(import.meta.url).pathname)
 
 const commands: Record<string, { script: string; desc: string }> = {
   install: { script: "cf-install", desc: "Generate config, create DNS, deploy" },
+  deploy:  { script: "cf-deploy",  desc: "Deploy worker to Cloudflare" },
   prepare: { script: "cf-prepare", desc: "Resize + convert image to webp" },
   upload:  { script: "cf-upload",  desc: "Auto-prepare + upload via worker" },
   list:    { script: "cf-list",    desc: "List images (default 20, pass number for more)" },

@@ -57,6 +57,7 @@ doc/plan.md           Architecture and implementation plan
 | DELETE | `/delete/:secret/:sha1` | Delete image |
 | PUT | `/assets/:secret/:path` | Upload asset file |
 | GET | `/assets/:path` | Serve asset (public, cached) |
+| GET | `/test/:sha1` | Visual test page - 100 image grid for cache testing |
 | GET | `/favicon.ico` | Orange square SVG |
 | GET | `/` | Text banner |
 | GET | `/debug` | JSON with cache status |
